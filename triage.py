@@ -1,199 +1,115 @@
 """
-AI Pipeline Failure Triage - Main triage logic using Ollama LLM
+AI Pipeline Failure Triage - Main triage logic using Ollama LLM.
+Refactored: uses config module, structured logging, typed return values, shared client.
 """
-
+import logging
 import time
+from typing import Dict, Optional
+
 from openai import OpenAI
+import config
 
-# Configuration
-BASE_URL = "http://localhost:11434/v1"
-API_KEY = "ollama"
-MODEL = "llama3.2"
-TIMEOUT_SECONDS = 60
-MAX_RETRIES = 3
-LOOP_DETECTION_LIMIT = 3
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger("triage")
 
-# Required fields in the response
-REQUIRED_FIELDS = ["PIPELINE", "PHASE", "WHAT", "WHY", "FIX", "RERUN"]
-
-# Termination conditions
-TERMINATION_CONDITIONS = [
-    "PERMISSION_DENIED",
-    "ACCESS_DENIED",
-    "AUTHENTICATION_FAILED",
-    "CRITICAL_FAILURE",
-]
+_client = OpenAI(
+    base_url=config.BASE_URL,
+    api_key=config.API_KEY,
+    timeout=config.TIMEOUT_SECONDS,
+)
 
 
-def _parse_response(response_text):
-    """
-    Parse the LLM response to extract the 6 required fields.
-
-    Args:
-        response_text: Raw response from the LLM
-
-    Returns:
-        Dictionary with the 6 fields, or None if parsing fails
-    """
-    result = {}
-    lines = response_text.strip().split("\n")
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _parse_response(response_text: str) -> Optional[Dict[str, str]]:
+    """Extract the 6 required fields from the LLM response."""
+    result: Dict[str, str] = {}
+    lines = response_text.strip().splitlines()
     for line in lines:
         line = line.strip()
         if not line:
             continue
-
-        # Check if line starts with a required field
-        for field in REQUIRED_FIELDS:
+        for field in config.REQUIRED_FIELDS:
             if line.startswith(field + ":"):
-                value = line[len(field) + 1:].strip()
-                result[field] = value
+                result[field] = line[len(field) + 1:].strip()
                 break
-
-    # Validate all 6 fields are present and not empty
-    if all(field in result and result[field].strip() for field in REQUIRED_FIELDS):
-        return result
-    return None
+    return result if all(f in result and result[f].strip() for f in config.REQUIRED_FIELDS) else None
 
 
-def _check_termination_condition(analysis):
+def _check_termination(analysis: Dict[str, str]) -> bool:
+    """Return True if the analysis contains a critical condition."""
+    text = " ".join(analysis.values()).upper()
+    return any(kw.upper() in text for kw in config.TERMINATION_CONDITIONS)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def triage_pipeline_failure(build_log: str, pipeline_name: str = "unknown") -> Dict:
     """
-    Check if the analysis indicates a critical condition requiring termination.
+    Triage a CodeBuild/pipeline failure using the LLM.
 
     Args:
-        analysis: Parsed analysis dictionary
+        build_log:     Raw CodeBuild failure log text.
+        pipeline_name: Descriptive name for logging.
 
     Returns:
-        True if termination is needed, False otherwise
+        Dict with triage fields plus 'requires_human_intervention' bool
+        and 'processing_time_seconds'.
     """
-    what = analysis.get("WHAT", "").upper()
-    why = analysis.get("WHY", "").upper()
+    logger.info("Starting triage for pipeline: %s", pipeline_name)
+    start = time.time()
 
-    for condition in TERMINATION_CONDITIONS:
-        if condition in what or condition in why:
-            return True
-    return False
+    from prompts import build_messages
+    messages = build_messages(build_log)
 
+    seen_responses: list = []
 
-def _detect_loop(previous_results):
-    """
-    Detect if the same error is repeating.
-
-    Args:
-        previous_results: List of previous result dictionaries
-
-    Returns:
-        True if same error repeats LOOP_DETECTION_LIMIT times, False otherwise
-    """
-    if len(previous_results) < LOOP_DETECTION_LIMIT:
-        return False
-
-    # Check last N results for same WHAT field
-    recent = previous_results[-LOOP_DETECTION_LIMIT:]
-    what_values = [r.get("WHAT", "") for r in recent]
-
-    # If all same, it's a loop
-    return len(set(what_values)) == 1
-
-
-def triage_failure(logs, pipeline_name):
-    """
-    Triage a build failure using Ollama LLM with four-layer termination safety.
-
-    Args:
-        logs: String containing build log entries
-        pipeline_name: Name of the pipeline or project
-
-    Returns:
-        Dictionary with fields: PIPELINE, PHASE, WHAT, WHY, FIX, RERUN
-
-    Raises:
-        Exception: If all retries fail or response is invalid
-    """
-    from prompts import SYSTEM_PROMPT, build_prompt
-
-    # Build the prompt
-    user_message = build_prompt(logs, pipeline_name)
-
-    # Initialize the client
-    client = OpenAI(base_url=BASE_URL, api_key=API_KEY, timeout=TIMEOUT_SECONDS)
-
-    # Track previous results for loop detection
-    previous_results = []
-
-    # Retry logic with exponential backoff
-    last_error = None
-
-    for attempt in range(MAX_RETRIES):
-        # Layer 4: Loop detection
-        if _detect_loop(previous_results):
-            raise ValueError(f"Loop detected: same error repeated {LOOP_DETECTION_LIMIT} times")
+    for attempt in range(1, config.MAX_RETRIES + 1):
+        elapsed = time.time() - start
+        if elapsed > config.TIMEOUT_SECONDS:
+            logger.error("Timeout after %.1fs", elapsed)
+            return {"error": f"Timeout after {elapsed:.1f}s", "requires_human_intervention": True}
 
         try:
-            # Make the LLM call
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.3,
-                max_tokens=500,
+            response = _client.chat.completions.create(
+                model=config.MODEL,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=400,
             )
-
-            # Extract response text
             response_text = response.choices[0].message.content
+            logger.debug("LLM response (attempt %d): %s", attempt, response_text[:120])
+        except Exception as exc:
+            logger.error("LLM call failed on attempt %d: %s", attempt, exc)
+            time.sleep(2 ** attempt)
+            continue
 
-            # Validate response - check all 6 fields are present
-            result = _parse_response(response_text)
+        # Loop detection
+        if response_text in seen_responses:
+            logger.warning("Loop detected on attempt %d, breaking.", attempt)
+            break
+        seen_responses.append(response_text)
+        if len(seen_responses) >= config.LOOP_DETECTION_LIMIT:
+            seen_responses.clear()
 
-            if result is None:
-                # Invalid response format - could retry
-                last_error = ValueError(f"Invalid response format - missing required fields: {response_text}")
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff
-                    time.sleep(wait_time)
-                    continue
-                raise last_error
+        analysis = _parse_response(response_text)
+        if not analysis:
+            logger.warning("Parse failed on attempt %d. Missing required fields.", attempt)
+            time.sleep(1)
+            continue
 
-            # Track result for loop detection
-            previous_results.append(result)
+        needs_human = _check_termination(analysis)
+        analysis["requires_human_intervention"] = needs_human
+        analysis["processing_time_seconds"] = round(time.time() - start, 2)
+        if needs_human:
+            logger.warning("Critical condition detected - human intervention required!")
+        logger.info("Triage complete in %.2fs", analysis["processing_time_seconds"])
+        return analysis
 
-            # Layer 1: Check termination condition
-            if _check_termination_condition(result):
-                pass
-
-            # Layer 2: Additional validation - ensure fields are meaningful
-            # Re-check all 6 fields are actually populated
-            if not all(result.get(field, "").strip() for field in REQUIRED_FIELDS):
-                last_error = ValueError("Some fields are empty after parsing")
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt
-                    time.sleep(wait_time)
-                    continue
-                raise last_error
-
-            # All validations passed, return result
-            return result
-
-        except Exception as e:
-            last_error = e
-            error_str = str(e).lower()
-
-            # Check if it's a connection error
-            is_connection_error = any(
-                keyword in error_str
-                for keyword in ["connection", "timeout", "refused", "unreachable"]
-            )
-
-            if is_connection_error and attempt < MAX_RETRIES - 1:
-                # Exponential backoff: 1s, 2s, 4s
-                wait_time = 2 ** attempt
-                time.sleep(wait_time)
-                continue
-            elif not is_connection_error:
-                # Non-connection error, don't retry
-                raise
-
-    # All retries exhausted
-    raise last_error
+    logger.error("All %d attempts exhausted.", config.MAX_RETRIES)
+    return {"error": f"Failed after {config.MAX_RETRIES} retries", "requires_human_intervention": True}
